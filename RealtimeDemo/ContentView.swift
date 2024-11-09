@@ -6,81 +6,79 @@
 //
 
 import SwiftUI
-import CoreData
+import AVFoundation
+import Network
 
 struct ContentView: View {
-    @Environment(\.managedObjectContext) private var viewContext
-
-    @FetchRequest(
-        sortDescriptors: [NSSortDescriptor(keyPath: \Item.timestamp, ascending: true)],
-        animation: .default)
-    private var items: FetchedResults<Item>
-
+    @StateObject private var viewModel = RealtimeSpeechViewModel()
+    
     var body: some View {
-        NavigationView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp!, formatter: itemFormatter)")
-                    } label: {
-                        Text(item.timestamp!, formatter: itemFormatter)
+        VStack {
+            Text("Realtime Speech Demo")
+                .font(.largeTitle)
+                .padding()
+            Button(action: {
+//                viewModel.copyMessagesToClipboard()
+            }) {
+                Text("Copy Messages")
+                    .foregroundColor(.blue)
+            }
+            .padding()
+            ScrollView {
+                ForEach(viewModel.messages, id: \.id) { message in
+                    HStack(alignment: .top) {
+                        if message.isUser {
+                            Spacer()
+                            Text(message.text)
+                                .padding()
+                                .background(Color.blue.opacity(0.2))
+                                .cornerRadius(10)
+                                .padding(.horizontal)
+                        } else {
+                            Text(message.text)
+                                .padding()
+                                .background(Color.gray.opacity(0.2))
+                                .cornerRadius(10)
+                                .padding(.horizontal)
+                            Spacer()
+                        }
                     }
                 }
-                .onDelete(perform: deleteItems)
             }
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
+            
+            HStack {
+                Button(action: {
+                    viewModel.toggleRecording()
+                }) {
+                    Image(systemName: viewModel.isRecording ? "mic.circle.fill" : "mic.circle")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(height: 50)
+                        .padding()
                 }
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
+                
+                TextField("Type a message...", text: $viewModel.textInput, onCommit: {
+                    viewModel.sendTextMessage()
+                })
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .padding()
+                
+                Button(action: {
+                    viewModel.sendTextMessage()
+                }) {
+                    Image(systemName: "paperplane.fill")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(height: 30)
+                        .padding()
                 }
             }
-            Text("Select an item")
+        }
+        .onAppear {
+            viewModel.connect()
+        }
+        .onDisappear {
+            viewModel.disconnect()
         }
     }
-
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(context: viewContext)
-            newItem.timestamp = Date()
-
-            do {
-                try viewContext.save()
-            } catch {
-                // Replace this implementation with code to handle the error appropriately.
-                // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
-                let nsError = error as NSError
-                fatalError("Unresolved error \(nsError), \(nsError.userInfo)")
-            }
-        }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            offsets.map { items[$0] }.forEach(viewContext.delete)
-
-            do {
-                try viewContext.save()
-            } catch {
-                // Replace this implementation with code to handle the error appropriately.
-                // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
-                let nsError = error as NSError
-                fatalError("Unresolved error \(nsError), \(nsError.userInfo)")
-            }
-        }
-    }
-}
-
-private let itemFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.dateStyle = .short
-    formatter.timeStyle = .medium
-    return formatter
-}()
-
-#Preview {
-    ContentView().environment(\.managedObjectContext, PersistenceController.preview.container.viewContext)
 }
