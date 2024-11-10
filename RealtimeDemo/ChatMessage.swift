@@ -401,3 +401,23 @@ class ResponseAudioDoneEvent: ServerEvent {
         try super.init(from: decoder)
     }
 }
+
+class ConversationItemTruncatedEvent: ServerEvent {
+    let item_id: String
+    let content_index: Int
+    let audio_end_ms: Int
+
+    enum CodingKeys: String, CodingKey {
+        case item_id
+        case content_index
+        case audio_end_ms
+    }
+
+    required init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        item_id = try container.decode(String.self, forKey: .item_id)
+        content_index = try container.decode(Int.self, forKey: .content_index)
+        audio_end_ms = try container.decode(Int.self, forKey: .audio_end_ms)
+        try super.init(from: decoder)
+    }
+}

@@ -9,7 +9,7 @@ import SwiftUI
 import AVFoundation
 import Network
 
-/// ViewModel for handling real-time speech interactions using OpenAI's Realtime API.
+/// ViewModel for handling real-time speech interactions.
 /// This class manages audio recording, playback, and WebSocket communication with the server.
 /// It processes and sends user speech to the server and handles the assistant's text and audio responses.
 class RealtimeSpeechViewModel: NSObject, ObservableObject {
@@ -19,11 +19,18 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     /// An array of chat messages displayed in the UI.
     @Published var messages: [ChatMessage] = []
     
-    /// Indicates whether the app is currently recording audio.
-    @Published var isRecording = false
-    
     /// The text input from the user (for typed messages).
     @Published var textInput = ""
+    
+    /// The current state of the interaction: speaking, listening, or idle.
+    @Published var currentState: State = .idle
+    
+    /// Enum representing the possible states of the interaction.
+    enum State {
+        case speaking
+        case listening
+        case idle
+    }
     
     // MARK: - Private Properties
     
@@ -38,9 +45,6 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     
     /// A flag indicating whether the WebSocket connection is active.
     private var isConnected = false
-    
-    /// A flag indicating whether the assistant is currently speaking.
-    private var isAssistantSpeaking = false
     
     /// The URL of the server to connect to.
     /// Update this with your server's WebSocket URL.
@@ -57,12 +61,19 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     /// The audio format used for playback.
     private var playbackFormat: AVAudioFormat?
     
-    private var playbackBufferQueue = DispatchQueue(label: "playbackBufferQueue")
-    private var scheduledBufferCount = 0
-    private var assistantResponseCompleted = false
-    
+    /// Tracks the number of audio buffers pending playback.
     private var audioBuffersPending: Int = 0
+    
+    /// Indicates whether the assistant's response is fully received.
     private var isAssistantResponseDone: Bool = false
+    
+    /// Variables to keep track of the current response and item IDs
+    private var currentResponseID: String?
+    private var currentItemID: String?
+    private var currentContentIndex: Int?
+    
+    /// Tracks the audio playback position for potential truncation.
+    private var audioPlaybackPositionMs: Int = 0
     
     // MARK: - Initialization
     
@@ -101,7 +112,7 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     private func listen() {
         webSocketTask?.receive { [weak self] result in
             switch result {
-                case .failure(let error):
+            case .failure(let error):
                 print("WebSocket receive error: \(error)")
             case .success(let message):
                 self?.handleMessage(message)
@@ -117,11 +128,11 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     /// - Parameter message: The message received from the WebSocket.
     private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
         switch message {
-            case .string(let text):
+        case .string(let text):
             parseServerMessage(text)
         case .data(_):
             print("Received binary data which is unexpected.")
-            @unknown default:
+        @unknown default:
             break
         }
     }
@@ -139,6 +150,8 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
             
             // Decode and handle the specific event type.
             switch baseEvent.type {
+            case "conversation.item.input_audio_transcription.completed":
+                print("HERE")
             case "response.audio.delta":
                 let event = try decoder.decode(ResponseAudioDeltaEvent.self, from: data)
                 handleServerEvent(event)
@@ -184,6 +197,9 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
             case "response.audio.done":
                 let event = try decoder.decode(ResponseAudioDoneEvent.self, from: data)
                 handleServerEvent(event)
+            case "conversation.item.truncated":
+                let event = try decoder.decode(ConversationItemTruncatedEvent.self, from: data)
+                handleServerEvent(event)
             case "error":
                 let event = try decoder.decode(ErrorEvent.self, from: data)
                 handleServerEvent(event)
@@ -221,16 +237,15 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
             }
         case "rate_limits.updated":
             if let rateLimitsUpdatedEvent = event as? RateLimitsUpdatedEvent {
-                // Update rate limit logic if needed.
                 print("Rate limits updated: \(rateLimitsUpdatedEvent.rate_limits)")
             }
         case "response.output_item.added":
             if let outputItemAddedEvent = event as? ResponseOutputItemAddedEvent {
-                // Handle as needed.
+                handleResponseOutputItemAddedEvent(outputItemAddedEvent)
             }
         case "response.done":
             if let responseDoneEvent = event as? ResponseDoneEvent {
-handleResponseDoneEvent(responseDoneEvent)
+                handleResponseDoneEvent(responseDoneEvent)
             }
         case "response.content_part.added":
             if let contentPartAddedEvent = event as? ResponseContentPartAddedEvent {
@@ -260,6 +275,10 @@ handleResponseDoneEvent(responseDoneEvent)
             if let audioDoneEvent = event as? ResponseAudioDoneEvent {
                 handleResponseAudioDoneEvent(audioDoneEvent)
             }
+        case "conversation.item.truncated":
+            if let truncatedEvent = event as? ConversationItemTruncatedEvent {
+                handleConversationItemTruncatedEvent(truncatedEvent)
+            }
         case "error":
             if let errorEvent = event as? ErrorEvent {
                 print("Error from server: \(errorEvent.error.message)")
@@ -274,14 +293,19 @@ handleResponseDoneEvent(responseDoneEvent)
     /// Handles audio delta events by playing incoming audio data.
     /// - Parameter event: The audio delta event from the server.
     private func handleAudioDeltaEvent(_ event: ResponseAudioDeltaEvent) {
-        if !isAssistantSpeaking {
-            isAssistantSpeaking = true
-            isAssistantResponseDone = false // Reset the flag
+        if currentState != .speaking {
             DispatchQueue.main.async {
+                self.currentState = .speaking
                 self.stopRecording()
-                self.resumePlayback() // Ensure playback is resumed
+                self.resumePlayback()
             }
+            isAssistantResponseDone = false
         }
+        
+        // Update current response and item IDs
+        currentResponseID = event.response_id
+        currentItemID = event.item_id
+        currentContentIndex = event.content_index
         
         // Proceed with processing the audio delta
         guard let base64Audio = event.delta,
@@ -299,7 +323,6 @@ handleResponseDoneEvent(responseDoneEvent)
     private func handleTranscriptDeltaEvent(_ event: ResponseAudioTranscriptDeltaEvent) {
         let deltaText = event.delta
         DispatchQueue.main.async {
-            // Find or create the message for the assistant.
             if let lastAssistantMessageIndex = self.messages.lastIndex(where: { !$0.isUser }) {
                 self.messages[lastAssistantMessageIndex].text += deltaText
             } else {
@@ -308,23 +331,12 @@ handleResponseDoneEvent(responseDoneEvent)
             }
         }
     }
-
-    // HandleResponseDoneEvent
-    private func handleResponseDoneEvent(_ event: ResponseDoneEvent) {
-        print("Assistant response fully done.")
-        DispatchQueue.main.async {
-            // Set the flag to indicate the assistant has finished responding
-            self.isAssistantResponseDone = true
-            // Do not start recording here
-        }
-    }
     
     /// Handles the completion of the assistant's transcript.
     /// - Parameter event: The transcript done event from the server.
     private func handleTranscriptDoneEvent(_ event: ResponseAudioTranscriptDoneEvent) {
         let transcript = event.transcript
         DispatchQueue.main.async {
-            // Update the assistant's message with the final transcript.
             if let lastAssistantMessageIndex = self.messages.lastIndex(where: { !$0.isUser }) {
                 self.messages[lastAssistantMessageIndex].text = transcript
             } else {
@@ -334,58 +346,74 @@ handleResponseDoneEvent(responseDoneEvent)
         }
     }
     
+    /// Handles the conversation item truncated event by pausing playback and updating state.
+    private func handleConversationItemTruncatedEvent(_ event: ConversationItemTruncatedEvent) {
+        print("Received conversation.item.truncated event. Item ID: \(event.item_id)")
+        DispatchQueue.main.async {
+            self.pausePlayback()
+            self.currentState = .idle
+            // Optionally, update the UI to reflect the truncation
+        }
+    }
+    
     /// Handles the creation of a new conversation item.
     /// - Parameter event: The conversation item created event from the server.
     private func handleConversationItemCreatedEvent(_ event: ConversationItemCreatedEvent) {
-        // You can use this to update your conversation history if needed.
         print("Conversation item created: \(event.item)")
     }
     
     /// Handles the response creation event.
     /// - Parameter event: The response created event from the server.
     private func handleResponseCreatedEvent(_ event: ResponseCreatedEvent) {
-        // Handle the response being created.
         print("Response created with ID: \(event.response.id)")
+        currentResponseID = event.response.id
+    }
+    
+    /// Handles when an output item is added to the response.
+    private func handleResponseOutputItemAddedEvent(_ event: ResponseOutputItemAddedEvent) {
+        currentItemID = event.item.id
+    }
+    
+    /// Handles when the assistant's response is fully done.
+    private func handleResponseDoneEvent(_ event: ResponseDoneEvent) {
+        print("Assistant response fully done.")
+        DispatchQueue.main.async {
+            self.isAssistantResponseDone = true
+        }
+    }
+    
+    /// Handles when a response content part is added.
+    private func handleContentPartAddedEvent(_ event: ResponseContentPartAddedEvent) {
+        currentContentIndex = event.content_index
+        print("Response content part added.")
     }
     
     /// Handles the speech started event, indicating the user has started speaking.
-    /// - Parameter event: The input audio buffer speech started event.
     private func handleSpeechStartedEvent(_ event: InputAudioBufferSpeechStartedEvent) {
         print("User speech started, pausing playback.")
         DispatchQueue.main.async {
             self.pausePlayback()
-            self.isRecording = true
+            self.currentState = .listening
         }
     }
     
     /// Handles the speech stopped event, indicating the user has stopped speaking.
-    /// - Parameter event: The input audio buffer speech stopped event.
     private func handleSpeechStoppedEvent(_ event: InputAudioBufferSpeechStoppedEvent) {
-        print("User speech stopped.")
-        DispatchQueue.main.async {
-            self.isRecording = false
-            self.resumePlayback() // Resume playback after user stops speaking
-        }
+//        print("User speech stopped.")
+//        DispatchQueue.main.async {
+//            self.currentState = .speaking
+//            self.resumePlayback()
+//        }
     }
     
     /// Handles the input audio buffer committed event.
-    /// - Parameter event: The input audio buffer committed event.
     private func handleInputAudioBufferCommittedEvent(_ event: InputAudioBufferCommittedEvent) {
         print("Input audio buffer committed, item ID: \(event.item_id)")
     }
     
-    /// Handles when a response content part is added.
-    /// - Parameter event: The response content part added event.
-    private func handleContentPartAddedEvent(_ event: ResponseContentPartAddedEvent) {
-        print("Response content part added.")
-    }
-    
     /// Handles when the assistant's audio is done playing.
-    /// - Parameter event: The response audio done event.
     private func handleResponseAudioDoneEvent(_ event: ResponseAudioDoneEvent) {
         print("Assistant audio segment done.")
-        // Do not set isAssistantSpeaking = false here
-        // Do not start recording yet
     }
     
     // MARK: - Sending Messages
@@ -425,17 +453,16 @@ handleResponseDoneEvent(responseDoneEvent)
     private func sendResponseCreateEvent() {
         let responseCreateEvent: [String: Any] = [
             "type": "response.create",
-                         "response": [
-                         "modalities": ["text", "audio"],
-                                    "instructions": "Please assist the user."
-                         ]
+            "response": [
+                "modalities": ["text", "audio"],
+                "instructions": "Please assist the user."
+            ]
         ]
         
         sendJSON(responseCreateEvent)
     }
     
     /// Sends a JSON message over the WebSocket connection.
-    /// - Parameter jsonObject: The JSON object to send.
     private func sendJSON(_ jsonObject: [String: Any]) {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject, options: []),
               let jsonString = String(data: jsonData, encoding: .utf8) else { return }
@@ -448,6 +475,94 @@ handleResponseDoneEvent(responseDoneEvent)
         }
     }
     
+    // MARK: - State Control Methods
+    
+    /// Interrupts the speaking state, cancels the response, and moves to idle state.
+    func interruptSpeaking() {
+        guard currentState == .speaking else { return }
+        pausePlayback()
+//        if !isAssistantResponseDone {
+            // Interrupt response only if still generating, because if it's interrupted otherwise it will assume it's the user's speech being interrupted I guess
+            sendResponseCancelEvent()
+//        }
+        if let itemID = currentItemID, let contentIndex = currentContentIndex {
+            let audioEndMs = audioPlaybackPositionMs
+            sendConversationItemTruncateEvent(itemID: itemID, contentIndex: contentIndex, audioEndMs: audioEndMs)
+        }
+        currentState = .idle
+    }
+    
+    /// Sends a response.cancel event to the server to cancel the current response.
+    private func sendResponseCancelEvent() {
+        let event: [String: Any] = [
+            "type": "response.cancel"
+        ]
+        sendJSON(event)
+    }
+    
+    /// Sends a conversation.item.truncate event to the server to truncate the assistant's response.
+    private func sendConversationItemTruncateEvent(itemID: String, contentIndex: Int, audioEndMs: Int) {
+        let event: [String: Any] = [
+            "type": "conversation.item.truncate",
+            "item_id": itemID,
+            "content_index": contentIndex,
+            "audio_end_ms": audioEndMs
+        ]
+        sendJSON(event)
+    }
+    
+    /// Interrupts the listening state, stops recording, clears the input audio buffer, and moves to idle state.
+    func interruptListening() {
+        guard currentState == .listening else { return }
+        stopRecording()
+        sendInputAudioBufferClearEvent()
+        currentState = .idle
+    }
+    
+    private func stopAndClearPlayback() {
+        playbackPlayerNode?.stop()
+//        audioBuffersPending = 0
+        audioPlaybackPositionMs = 0
+        isAssistantResponseDone = true
+        print("Playback stopped and buffers cleared.")
+    }
+    
+    /// Sends an input_audio_buffer.clear event to the server.
+    private func sendInputAudioBufferClearEvent() {
+        let event: [String: Any] = [
+            "type": "input_audio_buffer.clear"
+        ]
+        sendJSON(event)
+    }
+    
+    /// Starts speaking any leftover buffers and moves to speaking state.
+    func startSpeakingLeftoverBuffers() {
+        guard currentState != .speaking else { return }
+        if audioBuffersPending > 0 {
+            currentState = .speaking
+            resumePlayback()
+        } else {
+            print("No leftover buffers to play.")
+        }
+    }
+    
+    /// Starts listening by initiating audio recording and moves to listening state.
+    func startListening() {
+        if currentState == .speaking {
+            print("Cannot start listening while assistant is speaking")
+            return
+        }
+        if currentState != .listening {
+            // Clear audio buffer on the server
+            sendInputAudioBufferClearEvent()
+            // Stop and clear playback
+            stopAndClearPlayback()
+            
+            // Start recording
+            startRecording()
+        }
+    }
+    
     // MARK: - Audio Control Methods
     
     /// Pauses the audio playback.
@@ -455,8 +570,8 @@ handleResponseDoneEvent(responseDoneEvent)
         playbackPlayerNode?.pause()
         print("Playback paused.")
     }
-
-    /// Resumes the audio playback
+    
+    /// Resumes the audio playback.
     private func resumePlayback() {
         playbackPlayerNode?.play()
         print("Playback resumed.")
@@ -466,35 +581,37 @@ handleResponseDoneEvent(responseDoneEvent)
     
     /// Toggles the audio recording state.
     func toggleRecording() {
-        if isAssistantSpeaking {
+        if currentState == .speaking {
             print("Cannot start recording while assistant is speaking")
             return
         }
         
-        if isRecording {
+        if currentState == .listening {
             stopRecording()
         } else {
-            startRecording()
+            startListening()
         }
     }
     
     /// Starts recording audio from the microphone.
     private func startRecording() {
-        let audioSession = AVAudioSession.sharedInstance()
-        audioSession.requestRecordPermission { [weak self] granted in
-            if granted {
-            do {
-            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
-                try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-                self?.setupAudioEngine()
-                DispatchQueue.main.async {
-                self?.isRecording = true
+        DispatchQueue.main.async {
+            let audioSession = AVAudioSession.sharedInstance()
+            audioSession.requestRecordPermission { [weak self] granted in
+                if granted {
+                    do {
+                        try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
+                        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                        self?.setupAudioEngine()
+                        DispatchQueue.main.async {
+                            self?.currentState = .listening
+                        }
+                    } catch {
+                        print("Failed to set up audio session: \(error)")
+                    }
+                } else {
+                    print("Microphone access denied.")
                 }
-            } catch {
-                print("Failed to set up audio session: \(error)")
-            }
-            } else {
-                print("Microphone access denied.")
             }
         }
     }
@@ -504,9 +621,9 @@ handleResponseDoneEvent(responseDoneEvent)
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine = nil
-        DispatchQueue.main.async {
-            self.isRecording = false
-        }
+//        DispatchQueue.main.async {
+//            self.currentState = .idle
+//        }
     }
     
     /// Sets up the audio engine for recording.
@@ -517,10 +634,8 @@ handleResponseDoneEvent(responseDoneEvent)
         let inputNode = audioEngine.inputNode
         let bus = 0
         
-        // Use the hardware's input format to avoid format mismatches.
         let inputFormat = inputNode.inputFormat(forBus: bus)
         
-        // Install a tap on the input node to capture audio buffers.
         inputNode.installTap(onBus: bus, bufferSize: 1024, format: inputFormat) { [weak self] (buffer, _) in
             self?.processAudioBuffer(buffer)
         }
@@ -533,24 +648,19 @@ handleResponseDoneEvent(responseDoneEvent)
     }
     
     /// Processes the captured audio buffer, converts it to the desired format, and sends it to the server.
-    /// - Parameter buffer: The audio buffer captured from the microphone.
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-        // Return immediately if the assistant is speaking
-        guard !isAssistantSpeaking else {
+        guard currentState != .speaking else {
             return
         }
         
-        // Define the desired format (PCM 16-bit, 24 kHz, mono) as expected by the server.
         let desiredSampleRate: Double = 24000.0
         let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: desiredSampleRate, channels: 1, interleaved: true)!
         
-        // Create an audio converter to convert the buffer to the desired format.
         guard let converter = AVAudioConverter(from: buffer.format, to: desiredFormat) else {
             print("Failed to create AVAudioConverter")
             return
         }
         
-        // Calculate the frame capacity for the converted buffer.
         let sampleRateRatio = desiredSampleRate / buffer.format.sampleRate
         let convertedFrameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * sampleRateRatio)
         
@@ -565,7 +675,6 @@ handleResponseDoneEvent(responseDoneEvent)
             return buffer
         }
         
-        // Perform the conversion.
         let status = converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
         
         if let error = error {
@@ -573,20 +682,17 @@ handleResponseDoneEvent(responseDoneEvent)
             return
         }
         
-        if status != .haveData /*&& status != .inputRanOut*/ {
+        if status != .haveData {
             print("Conversion ended with status: \(status)")
             return
         }
         
-        // Access the audio data from the converted buffer.
         guard let channelData = convertedBuffer.int16ChannelData else { return }
         let channelDataPointer = channelData.pointee
         let dataSize = Int(convertedBuffer.frameLength) * MemoryLayout<Int16>.size
         
-        // Create a Data object from the audio buffer.
         let data = Data(bytes: channelDataPointer, count: dataSize)
         
-        // Send the audio data to the server.
         let audioMessage: [String: Any] = [
             "type": "input_audio_buffer.append",
             "audio": data.base64EncodedString()
@@ -607,11 +713,9 @@ handleResponseDoneEvent(responseDoneEvent)
         
         playbackEngine.attach(playbackPlayerNode)
         
-        // Use the hardware's preferred sample rate and format.
         let outputFormat = playbackEngine.outputNode.inputFormat(forBus: 0)
         playbackFormat = outputFormat
         
-        // Connect the player node to the main mixer node with the output format.
         playbackEngine.connect(playbackPlayerNode, to: playbackEngine.mainMixerNode, format: playbackFormat)
         
         do {
@@ -633,51 +737,41 @@ handleResponseDoneEvent(responseDoneEvent)
     }
     
     /// Plays the audio data received from the assistant.
-    /// - Parameter data: The audio data to play.
     private func playAudioData(_ data: Data) {
         guard let playbackPlayerNode = playbackPlayerNode,
               let playbackFormat = playbackFormat else { return }
         
-        // Define the input format matching the server's audio data (PCM 16-bit, 24 kHz, mono).
         let inputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000.0, channels: 1, interleaved: true)!
         
-        // Convert the data to an audio buffer.
         guard let inputBuffer = dataToPCMBuffer(data: data, format: inputFormat) else { return }
         
-        // Convert the buffer to the playback format.
         guard let bufferToPlay = convertBuffer(inputBuffer, to: playbackFormat) else { return }
         
-        // Increment the pending buffers counter
-        DispatchQueue.main.async {
-            self.audioBuffersPending += 1
-        }
+        let durationInSeconds = Double(bufferToPlay.frameLength) / playbackFormat.sampleRate
+        let durationInMs = Int(durationInSeconds * 1000)
+        audioPlaybackPositionMs += durationInMs
         
-        // Schedule the buffer for playback with a completion handler
+        audioBuffersPending += 1
+        
         playbackPlayerNode.scheduleBuffer(bufferToPlay, completionHandler: {
             DispatchQueue.main.async {
                 self.audioBuffersPending -= 1
                 print("Buffer played, pending buffers: \(self.audioBuffersPending)")
                 
-                // Check if all buffers have played and the assistant has finished responding
                 if self.audioBuffersPending == 0 && self.isAssistantResponseDone {
-                    print("All audio buffers played, starting recording.")
-                    self.isAssistantSpeaking = false
-                    self.startRecording()
+                    print("All audio buffers played, starting listening.")
+                    self.currentState = .idle
+                    self.startListening()
                 }
             }
         })
         
-        // Ensure the player node is playing
         if !playbackPlayerNode.isPlaying {
             playbackPlayerNode.play()
         }
     }
     
     /// Converts raw Data into an AVAudioPCMBuffer with the specified format.
-    /// - Parameters:
-    ///   - data: The raw audio data.
-    ///   - format: The audio format to use.
-    /// - Returns: An optional AVAudioPCMBuffer containing the audio data.
     private func dataToPCMBuffer(data: Data, format: AVAudioFormat) -> AVAudioPCMBuffer? {
         let frameCount = UInt32(data.count) / format.streamDescription.pointee.mBytesPerFrame
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
@@ -686,17 +780,13 @@ handleResponseDoneEvent(responseDoneEvent)
         data.withUnsafeBytes { rawBufferPointer in
             guard let rawPointer = rawBufferPointer.baseAddress else { return }
             let audioBufferPointer = buffer.int16ChannelData![0]
-            audioBufferPointer.update(from: rawPointer.assumingMemoryBound(to: Int16.self), count: Int(buffer.frameLength))
+            audioBufferPointer.assign(from: rawPointer.assumingMemoryBound(to: Int16.self), count: Int(buffer.frameLength))
         }
         
         return buffer
     }
     
     /// Converts an audio buffer to the specified output format.
-    /// - Parameters:
-    ///   - inputBuffer: The input audio buffer.
-    ///   - outputFormat: The desired output audio format.
-    /// - Returns: An optional AVAudioPCMBuffer in the output format.
     private func convertBuffer(_ inputBuffer: AVAudioPCMBuffer, to outputFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
         guard let converter = AVAudioConverter(from: inputBuffer.format, to: outputFormat) else {
             print("Failed to create AVAudioConverter for playback")
@@ -712,7 +802,6 @@ handleResponseDoneEvent(responseDoneEvent)
             return inputBuffer
         }
         
-        // Perform the conversion.
         converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
         
         if let error = error {
@@ -728,4 +817,3 @@ handleResponseDoneEvent(responseDoneEvent)
 extension RealtimeSpeechViewModel: AVAudioRecorderDelegate {
     // Implement AVAudioRecorder delegate methods if necessary.
 }
-

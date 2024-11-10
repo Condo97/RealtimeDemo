@@ -1,84 +1,92 @@
 //
-//  ContentView.swift
-//  RealtimeDemo
+// ContentView.swift
+// RealtimeDemo
 //
-//  Created by Alex Coundouriotis on 11/8/24.
+// Created by Alex Coundouriotis on 11/8/24.
 //
 
 import SwiftUI
-import AVFoundation
-import Network
 
 struct ContentView: View {
-    @StateObject private var viewModel = RealtimeSpeechViewModel()
+    
+    @ObservedObject var viewModel = RealtimeSpeechViewModel()
+    @State private var showPauseButton = false
     
     var body: some View {
-        VStack {
-            Text("Realtime Speech Demo")
-                .font(.largeTitle)
-                .padding()
-            Button(action: {
-//                viewModel.copyMessagesToClipboard()
-            }) {
-                Text("Copy Messages")
-                    .foregroundColor(.blue)
-            }
-            .padding()
-            ScrollView {
-                ForEach(viewModel.messages, id: \.id) { message in
-                    HStack(alignment: .top) {
-                        if message.isUser {
-                            Spacer()
-                            Text(message.text)
-                                .padding()
-                                .background(Color.blue.opacity(0.2))
-                                .cornerRadius(10)
-                                .padding(.horizontal)
-                        } else {
-                            Text(message.text)
-                                .padding()
-                                .background(Color.gray.opacity(0.2))
-                                .cornerRadius(10)
-                                .padding(.horizontal)
-                            Spacer()
-                        }
+        ZStack {
+            Color.black
+                .ignoresSafeArea()
+                .onTapGesture {
+                    handleTapGesture()
+                }
+            
+            VStack {
+                // Top circle: Speaking indicator
+                Circle()
+                    .fill(Color.blue)
+                    .frame(width: viewModel.currentState == .speaking ? 200 : 50,
+                           height: viewModel.currentState == .speaking ? 200 : 50)
+                    .animation(.spring(), value: viewModel.currentState)
+                    .padding()
+                
+                Spacer()
+                
+                // Bottom circle: Listening indicator
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: viewModel.currentState == .listening ? 200 : 50,
+                           height: viewModel.currentState == .listening ? 200 : 50)
+                    .animation(.spring(), value: viewModel.currentState)
+                    .padding()
+                
+                ScrollView {
+                    ForEach(viewModel.messages) { message in
+                        Text(message.text)
+                            .foregroundStyle(.white)
                     }
                 }
+                .frame(height: 500.0)
             }
             
-            HStack {
-                Button(action: {
-                    viewModel.toggleRecording()
-                }) {
-                    Image(systemName: viewModel.isRecording ? "mic.circle.fill" : "mic.circle")
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(height: 50)
+            if showPauseButton {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Button(action: {
+                            // Resume speaking leftover buffers
+                            viewModel.startSpeakingLeftoverBuffers()
+                            showPauseButton = false
+                        }) {
+                            Image(systemName: "play.fill")
+                                .foregroundColor(.white)
+                                .padding()
+                                .background(Color.gray.opacity(0.7))
+                                .clipShape(Circle())
+                        }
                         .padding()
-                }
-                
-                TextField("Type a message...", text: $viewModel.textInput, onCommit: {
-                    viewModel.sendTextMessage()
-                })
-                .textFieldStyle(RoundedBorderTextFieldStyle())
-                .padding()
-                
-                Button(action: {
-                    viewModel.sendTextMessage()
-                }) {
-                    Image(systemName: "paperplane.fill")
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(height: 30)
-                        .padding()
+                    }
                 }
             }
         }
         .onAppear {
             viewModel.connect()
         }
-        .onDisappear {
-            viewModel.disconnect()
+    }
+    
+    private func handleTapGesture() {
+        switch viewModel.currentState {
+        case .speaking:
+            // Interrupt speaking, display pause button
+            viewModel.interruptSpeaking()
+            showPauseButton = true
+        case .listening:
+            // Interrupt listening, notify server, discard recording
+            viewModel.interruptListening()
+        case .idle:
+            // Start listening
+            viewModel.startListening()
         }
     }
+    
 }
