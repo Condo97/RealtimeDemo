@@ -61,6 +61,9 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     private var scheduledBufferCount = 0
     private var assistantResponseCompleted = false
     
+    private var audioBuffersPending: Int = 0
+    private var isAssistantResponseDone: Bool = false
+    
     // MARK: - Initialization
     
     override init() {
@@ -273,12 +276,14 @@ handleResponseDoneEvent(responseDoneEvent)
     private func handleAudioDeltaEvent(_ event: ResponseAudioDeltaEvent) {
         if !isAssistantSpeaking {
             isAssistantSpeaking = true
+            isAssistantResponseDone = false // Reset the flag
             DispatchQueue.main.async {
                 self.stopRecording()
                 self.resumePlayback() // Ensure playback is resumed
             }
         }
         
+        // Proceed with processing the audio delta
         guard let base64Audio = event.delta,
               let audioData = Data(base64Encoded: base64Audio) else {
             print("Invalid audio data in delta.")
@@ -304,12 +309,13 @@ handleResponseDoneEvent(responseDoneEvent)
         }
     }
 
-    // Start recording in handleResponseDoneEvent
+    // HandleResponseDoneEvent
     private func handleResponseDoneEvent(_ event: ResponseDoneEvent) {
         print("Assistant response fully done.")
         DispatchQueue.main.async {
-            self.isAssistantSpeaking = false
-            self.startRecording()  // Resume recording
+            // Set the flag to indicate the assistant has finished responding
+            self.isAssistantResponseDone = true
+            // Do not start recording here
         }
     }
     
@@ -378,7 +384,8 @@ handleResponseDoneEvent(responseDoneEvent)
     /// - Parameter event: The response audio done event.
     private func handleResponseAudioDoneEvent(_ event: ResponseAudioDoneEvent) {
         print("Assistant audio segment done.")
-        // Do not modify isAssistantSpeaking here
+        // Do not set isAssistantSpeaking = false here
+        // Do not start recording yet
     }
     
     // MARK: - Sending Messages
@@ -630,7 +637,7 @@ handleResponseDoneEvent(responseDoneEvent)
     private func playAudioData(_ data: Data) {
         guard let playbackPlayerNode = playbackPlayerNode,
               let playbackFormat = playbackFormat else { return }
-
+        
         // Define the input format matching the server's audio data (PCM 16-bit, 24 kHz, mono).
         let inputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000.0, channels: 1, interleaved: true)!
         
@@ -639,10 +646,27 @@ handleResponseDoneEvent(responseDoneEvent)
         
         // Convert the buffer to the playback format.
         guard let bufferToPlay = convertBuffer(inputBuffer, to: playbackFormat) else { return }
-
-        // Schedule the buffer
-        playbackPlayerNode.scheduleBuffer(bufferToPlay, completionHandler: nil)
-
+        
+        // Increment the pending buffers counter
+        DispatchQueue.main.async {
+            self.audioBuffersPending += 1
+        }
+        
+        // Schedule the buffer for playback with a completion handler
+        playbackPlayerNode.scheduleBuffer(bufferToPlay, completionHandler: {
+            DispatchQueue.main.async {
+                self.audioBuffersPending -= 1
+                print("Buffer played, pending buffers: \(self.audioBuffersPending)")
+                
+                // Check if all buffers have played and the assistant has finished responding
+                if self.audioBuffersPending == 0 && self.isAssistantResponseDone {
+                    print("All audio buffers played, starting recording.")
+                    self.isAssistantSpeaking = false
+                    self.startRecording()
+                }
+            }
+        })
+        
         // Ensure the player node is playing
         if !playbackPlayerNode.isPlaying {
             playbackPlayerNode.play()
@@ -704,3 +728,4 @@ handleResponseDoneEvent(responseDoneEvent)
 extension RealtimeSpeechViewModel: AVAudioRecorderDelegate {
     // Implement AVAudioRecorder delegate methods if necessary.
 }
+
