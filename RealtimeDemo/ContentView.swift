@@ -40,7 +40,11 @@ struct ContentView: View {
                     .padding()
                 
                 ScrollView {
-                    ForEach(viewModel.messages) { message in
+                    Text(viewModel.currentlyWritingMessage?.text ?? "")
+                        .italic()
+                        .bold()
+                        .foregroundStyle(.white)
+                    ForEach(viewModel.finishedMessages) { message in
                         Text(message.text)
                             .foregroundStyle(.white)
                     }

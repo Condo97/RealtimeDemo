@@ -1,13 +1,12 @@
 //
 // RealtimeSpeechViewModel.swift
-// RealtimeDemo
-//
-// Created by Alex Coundouriotis on 11/8/24.
 //
 
 import SwiftUI
 import AVFoundation
 import Network
+import Speech
+import Accelerate
 
 /// ViewModel for handling real-time speech interactions.
 /// This class manages audio recording, playback, and WebSocket communication with the server.
@@ -24,6 +23,12 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     
     /// The current state of the interaction: speaking, listening, or idle.
     @Published var currentState: State = .idle
+    
+    /// Published property for recording volume (used for waveform visualization).
+    @Published var recordingVolume: Float = 0.0
+    
+    /// Published property for playback volume (used for waveform visualization).
+    @Published var playbackVolume: Float = 0.0
     
     /// Enum representing the possible states of the interaction.
     enum State {
@@ -74,6 +79,17 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     
     /// Tracks the audio playback position for potential truncation.
     private var audioPlaybackPositionMs: Int = 0
+    
+    // MARK: - Speech Recognition Properties
+    
+    /// Speech recognizer for transcribing user's speech.
+    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    
+    /// Recognition request for speech recognition.
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    
+    /// Recognition task for handling recognition callbacks.
+    private var recognitionTask: SFSpeechRecognitionTask?
     
     // MARK: - Initialization
     
@@ -399,11 +415,7 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     
     /// Handles the speech stopped event, indicating the user has stopped speaking.
     private func handleSpeechStoppedEvent(_ event: InputAudioBufferSpeechStoppedEvent) {
-//        print("User speech stopped.")
-//        DispatchQueue.main.async {
-//            self.currentState = .speaking
-//            self.resumePlayback()
-//        }
+        // Handle if needed.
     }
     
     /// Handles the input audio buffer committed event.
@@ -481,10 +493,8 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     func interruptSpeaking() {
         guard currentState == .speaking else { return }
         pausePlayback()
-//        if !isAssistantResponseDone {
-            // Interrupt response only if still generating, because if it's interrupted otherwise it will assume it's the user's speech being interrupted I guess
-            sendResponseCancelEvent()
-//        }
+        // Send response cancel event
+        sendResponseCancelEvent()
         if let itemID = currentItemID, let contentIndex = currentContentIndex {
             let audioEndMs = audioPlaybackPositionMs
             sendConversationItemTruncateEvent(itemID: itemID, contentIndex: contentIndex, audioEndMs: audioEndMs)
@@ -521,7 +531,6 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     
     private func stopAndClearPlayback() {
         playbackPlayerNode?.stop()
-//        audioBuffersPending = 0
         audioPlaybackPositionMs = 0
         isAssistantResponseDone = true
         print("Playback stopped and buffers cleared.")
@@ -603,8 +612,17 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
                         try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
                         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
                         self?.setupAudioEngine()
-                        DispatchQueue.main.async {
-                            self?.currentState = .listening
+                        // Request speech recognition authorization
+                        SFSpeechRecognizer.requestAuthorization { authStatus in
+                            switch authStatus {
+                            case .authorized:
+                                DispatchQueue.main.async {
+                                    self?.startSpeechRecognition()
+                                    self?.currentState = .listening
+                                }
+                            default:
+                                print("Speech recognition authorization was declined.")
+                            }
                         }
                     } catch {
                         print("Failed to set up audio session: \(error)")
@@ -616,14 +634,64 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         }
     }
     
+    /// Starts speech recognition for transcribing user's speech.
+    private func startSpeechRecognition() {
+        guard let recognizer = speechRecognizer, recognizer.isAvailable else {
+            print("Speech recognizer is not available.")
+            return
+        }
+        
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        
+        guard let recognitionRequest = recognitionRequest else {
+            fatalError("Unable to create an SFSpeechAudioBufferRecognitionRequest object")
+        }
+        
+        recognitionRequest.shouldReportPartialResults = true
+        
+        recognitionTask = recognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
+            guard let self = self else { return }
+            var isFinal = false
+            
+            if let result = result {
+                let transcription = result.bestTranscription.formattedString
+                print("Transcription: \(transcription)")
+                // Update the UI
+                DispatchQueue.main.async {
+                    // Update the messages array with user's transcription
+                    if let lastUserMessageIndex = self.messages.lastIndex(where: { $0.isUser }) {
+                        self.messages[lastUserMessageIndex].text = transcription
+                    } else {
+                        let message = ChatMessage(id: UUID(), text: transcription, isUser: true)
+                        self.messages.append(message)
+                    }
+                }
+                isFinal = result.isFinal
+            }
+            
+            if error != nil || isFinal {
+                self.audioEngine?.stop()
+                self.audioEngine?.inputNode.removeTap(onBus: 0)
+                
+                self.recognitionRequest = nil
+                self.recognitionTask = nil
+                
+                DispatchQueue.main.async {
+                    self.currentState = .idle
+                }
+            }
+        }
+    }
+    
     /// Stops recording audio.
     private func stopRecording() {
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine = nil
-//        DispatchQueue.main.async {
-//            self.currentState = .idle
-//        }
+        
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        recognitionTask = nil
     }
     
     /// Sets up the audio engine for recording.
@@ -637,7 +705,11 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         let inputFormat = inputNode.inputFormat(forBus: bus)
         
         inputNode.installTap(onBus: bus, bufferSize: 1024, format: inputFormat) { [weak self] (buffer, _) in
-            self?.processAudioBuffer(buffer)
+            guard let self = self else { return }
+            if let recognitionRequest = self.recognitionRequest {
+                recognitionRequest.append(buffer)
+            }
+            self.processAudioBuffer(buffer)
         }
         
         do {
@@ -699,6 +771,33 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         ]
         
         sendJSON(audioMessage)
+        
+        // Compute recording volume
+        DispatchQueue.main.async {
+            self.recordingVolume = self.computeVolumeFromInt16Data(buffer: convertedBuffer)
+        }
+    }
+    
+    /// Computes the volume level from Int16 audio data.
+    private func computeVolumeFromInt16Data(buffer: AVAudioPCMBuffer) -> Float {
+        guard let channelData = buffer.int16ChannelData else {
+            return 0.0
+        }
+        let channelDataValue = channelData.pointee
+        let frameLength = Int(buffer.frameLength)
+        var volume: Float = 0.0
+        
+        // Convert Int16 data to Float
+        let floatData = UnsafeMutablePointer<Float>.allocate(capacity: frameLength)
+        for i in 0..<frameLength {
+            floatData[i] = Float(channelDataValue[i]) / Float(Int16.max)
+        }
+        
+        vDSP_maxmgv(floatData, 1, &volume, vDSP_Length(buffer.frameLength))
+        
+        floatData.deallocate()
+        
+        return volume
     }
     
     // MARK: - Audio Playback
@@ -746,6 +845,11 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         guard let inputBuffer = dataToPCMBuffer(data: data, format: inputFormat) else { return }
         
         guard let bufferToPlay = convertBuffer(inputBuffer, to: playbackFormat) else { return }
+        
+        // Compute playback volume
+        DispatchQueue.main.async {
+            self.playbackVolume = self.computeVolumeFromBuffer(buffer: bufferToPlay)
+        }
         
         let durationInSeconds = Double(bufferToPlay.frameLength) / playbackFormat.sampleRate
         let durationInMs = Int(durationInSeconds * 1000)
@@ -811,6 +915,19 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         
         return outputBuffer
     }
+    
+    /// Computes the volume level from a Float32 audio buffer.
+    private func computeVolumeFromBuffer(buffer: AVAudioPCMBuffer) -> Float {
+        guard let channelData = buffer.floatChannelData else {
+            return 0.0
+        }
+        let channelDataValue = channelData.pointee
+        let channelDataArray = Array(UnsafeBufferPointer(start: channelDataValue, count: Int(buffer.frameLength)))
+        var rms: Float = 0.0
+        vDSP_rmsqv(channelDataArray, 1, &rms, vDSP_Length(buffer.frameLength))
+        return rms
+    }
+    
 }
 
 // Note: The extension for AVAudioRecorderDelegate is included if needed.
