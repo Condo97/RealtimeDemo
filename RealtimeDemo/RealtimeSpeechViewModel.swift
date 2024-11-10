@@ -57,6 +57,10 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     /// The audio format used for playback.
     private var playbackFormat: AVAudioFormat?
     
+    private var playbackBufferQueue = DispatchQueue(label: "playbackBufferQueue")
+    private var scheduledBufferCount = 0
+    private var assistantResponseCompleted = false
+    
     // MARK: - Initialization
     
     override init() {
@@ -223,7 +227,7 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
             }
         case "response.done":
             if let responseDoneEvent = event as? ResponseDoneEvent {
-                // Finalize any response handling here.
+handleResponseDoneEvent(responseDoneEvent)
             }
         case "response.content_part.added":
             if let contentPartAddedEvent = event as? ResponseContentPartAddedEvent {
@@ -271,6 +275,7 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
             isAssistantSpeaking = true
             DispatchQueue.main.async {
                 self.stopRecording()
+                self.resumePlayback() // Ensure playback is resumed
             }
         }
         
@@ -296,6 +301,15 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
                 let message = ChatMessage(id: UUID(), text: deltaText, isUser: false)
                 self.messages.append(message)
             }
+        }
+    }
+
+    // Start recording in handleResponseDoneEvent
+    private func handleResponseDoneEvent(_ event: ResponseDoneEvent) {
+        print("Assistant response fully done.")
+        DispatchQueue.main.async {
+            self.isAssistantSpeaking = false
+            self.startRecording()  // Resume recording
         }
     }
     
@@ -344,6 +358,7 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         print("User speech stopped.")
         DispatchQueue.main.async {
             self.isRecording = false
+            self.resumePlayback() // Resume playback after user stops speaking
         }
     }
     
@@ -362,11 +377,8 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     /// Handles when the assistant's audio is done playing.
     /// - Parameter event: The response audio done event.
     private func handleResponseAudioDoneEvent(_ event: ResponseAudioDoneEvent) {
-        print("Assistant speech done.")
-        DispatchQueue.main.async {
-            self.isAssistantSpeaking = false
-            self.startRecording()  // Resume recording
-        }
+        print("Assistant audio segment done.")
+        // Do not modify isAssistantSpeaking here
     }
     
     // MARK: - Sending Messages
@@ -434,11 +446,13 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     /// Pauses the audio playback.
     private func pausePlayback() {
         playbackPlayerNode?.pause()
+        print("Playback paused.")
     }
-    
-    /// Resumes the audio playback.
+
+    /// Resumes the audio playback
     private func resumePlayback() {
         playbackPlayerNode?.play()
+        print("Playback resumed.")
     }
     
     // MARK: - Audio Recording
@@ -616,7 +630,7 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     private func playAudioData(_ data: Data) {
         guard let playbackPlayerNode = playbackPlayerNode,
               let playbackFormat = playbackFormat else { return }
-        
+
         // Define the input format matching the server's audio data (PCM 16-bit, 24 kHz, mono).
         let inputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000.0, channels: 1, interleaved: true)!
         
@@ -625,9 +639,14 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         
         // Convert the buffer to the playback format.
         guard let bufferToPlay = convertBuffer(inputBuffer, to: playbackFormat) else { return }
-        
-        // Schedule the buffer for playback.
+
+        // Schedule the buffer
         playbackPlayerNode.scheduleBuffer(bufferToPlay, completionHandler: nil)
+
+        // Ensure the player node is playing
+        if !playbackPlayerNode.isPlaying {
+            playbackPlayerNode.play()
+        }
     }
     
     /// Converts raw Data into an AVAudioPCMBuffer with the specified format.
