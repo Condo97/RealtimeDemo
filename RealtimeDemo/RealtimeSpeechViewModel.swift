@@ -9,14 +9,17 @@ import Speech
 import Accelerate
 
 /// ViewModel for handling real-time speech interactions.
-/// This class manages audio recording, playback, and WebSocket communication with the server.
-/// It processes and sends user speech to the server and handles the assistant's text and audio responses.
+/// Manages audio recording, playback, and WebSocket communication with the server.
+/// Processes and sends user speech to the server and handles the assistant's text and audio responses.
 class RealtimeSpeechViewModel: NSObject, ObservableObject {
     
     // MARK: - Published Properties
     
-    /// An array of chat messages displayed in the UI.
-    @Published var messages: [ChatMessage] = []
+    /// The message currently being written by the assistant.
+    @Published var currentlyWritingMessage: ChatMessage?
+    
+    /// An array of completed chat messages displayed in the UI.
+    @Published var finishedMessages: [ChatMessage] = []
     
     /// The text input from the user (for typed messages).
     @Published var textInput = ""
@@ -339,11 +342,11 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     private func handleTranscriptDeltaEvent(_ event: ResponseAudioTranscriptDeltaEvent) {
         let deltaText = event.delta
         DispatchQueue.main.async {
-            if let lastAssistantMessageIndex = self.messages.lastIndex(where: { !$0.isUser }) {
-                self.messages[lastAssistantMessageIndex].text += deltaText
+            if let currentMessage = self.currentlyWritingMessage {
+                self.currentlyWritingMessage?.text += deltaText
             } else {
                 let message = ChatMessage(id: UUID(), text: deltaText, isUser: false)
-                self.messages.append(message)
+                self.currentlyWritingMessage = message
             }
         }
     }
@@ -353,11 +356,13 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     private func handleTranscriptDoneEvent(_ event: ResponseAudioTranscriptDoneEvent) {
         let transcript = event.transcript
         DispatchQueue.main.async {
-            if let lastAssistantMessageIndex = self.messages.lastIndex(where: { !$0.isUser }) {
-                self.messages[lastAssistantMessageIndex].text = transcript
+            if let currentMessage = self.currentlyWritingMessage {
+                self.currentlyWritingMessage?.text = transcript
+                self.finishedMessages.append(currentMessage)
+                self.currentlyWritingMessage = nil
             } else {
                 let message = ChatMessage(id: UUID(), text: transcript, isUser: false)
-                self.messages.append(message)
+                self.finishedMessages.append(message)
             }
         }
     }
@@ -395,6 +400,11 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         print("Assistant response fully done.")
         DispatchQueue.main.async {
             self.isAssistantResponseDone = true
+            // Move currentlyWritingMessage to finishedMessages if it's not already done
+            if let currentMessage = self.currentlyWritingMessage {
+                self.finishedMessages.append(currentMessage)
+                self.currentlyWritingMessage = nil
+            }
         }
     }
     
@@ -437,8 +447,9 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
         let message = textInput
         textInput = ""
         
+        let newMessage = ChatMessage(id: UUID(), text: message, isUser: true)
         DispatchQueue.main.async {
-            self.messages.append(ChatMessage(id: UUID(), text: message, isUser: true))
+            self.finishedMessages.append(newMessage)
         }
         
         let jsonMessage: [String: Any] = [
@@ -658,12 +669,18 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
                 print("Transcription: \(transcription)")
                 // Update the UI
                 DispatchQueue.main.async {
-                    // Update the messages array with user's transcription
-                    if let lastUserMessageIndex = self.messages.lastIndex(where: { $0.isUser }) {
-                        self.messages[lastUserMessageIndex].text = transcription
-                    } else {
+                    // Update the finishedMessages with user's transcription if it's a complete message
+                    if result.isFinal {
                         let message = ChatMessage(id: UUID(), text: transcription, isUser: true)
-                        self.messages.append(message)
+                        self.finishedMessages.append(message)
+                    } else {
+                        // Optionally handle intermediate transcriptions
+                        if let lastUserMessageIndex = self.finishedMessages.lastIndex(where: { $0.isUser }) {
+                            self.finishedMessages[lastUserMessageIndex].text = transcription
+                        } else {
+                            let message = ChatMessage(id: UUID(), text: transcription, isUser: true)
+                            self.finishedMessages.append(message)
+                        }
                     }
                 }
                 isFinal = result.isFinal
