@@ -342,11 +342,10 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     private func handleTranscriptDeltaEvent(_ event: ResponseAudioTranscriptDeltaEvent) {
         let deltaText = event.delta
         DispatchQueue.main.async {
-            if let currentMessage = self.currentlyWritingMessage {
-                self.currentlyWritingMessage?.text += deltaText
+            if self.currentlyWritingMessage == nil {
+                self.currentlyWritingMessage = ChatMessage(id: UUID(), text: deltaText, isUser: false)
             } else {
-                let message = ChatMessage(id: UUID(), text: deltaText, isUser: false)
-                self.currentlyWritingMessage = message
+                self.currentlyWritingMessage?.text += deltaText
             }
         }
     }
@@ -356,13 +355,14 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     private func handleTranscriptDoneEvent(_ event: ResponseAudioTranscriptDoneEvent) {
         let transcript = event.transcript
         DispatchQueue.main.async {
-            if let currentMessage = self.currentlyWritingMessage {
-                self.currentlyWritingMessage?.text = transcript
-                self.finishedMessages.append(currentMessage)
-                self.currentlyWritingMessage = nil
+            if self.currentlyWritingMessage == nil {
+                self.currentlyWritingMessage = ChatMessage(id: UUID(), text: transcript, isUser: false)
             } else {
-                let message = ChatMessage(id: UUID(), text: transcript, isUser: false)
+                self.currentlyWritingMessage?.text = transcript
+            }
+            if let message = self.currentlyWritingMessage {
                 self.finishedMessages.append(message)
+                self.currentlyWritingMessage = nil
             }
         }
     }
@@ -399,7 +399,7 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     private func handleResponseDoneEvent(_ event: ResponseDoneEvent) {
         print("Assistant response fully done.")
         DispatchQueue.main.async {
-            self.isAssistantResponseDone = true
+//            self.isAssistantResponseDone = true
             // Move currentlyWritingMessage to finishedMessages if it's not already done
             if let currentMessage = self.currentlyWritingMessage {
                 self.finishedMessages.append(currentMessage)
@@ -436,6 +436,9 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     /// Handles when the assistant's audio is done playing.
     private func handleResponseAudioDoneEvent(_ event: ResponseAudioDoneEvent) {
         print("Assistant audio segment done.")
+        DispatchQueue.main.async {
+            self.isAssistantResponseDone = true
+        }
     }
     
     // MARK: - Sending Messages
@@ -443,15 +446,14 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
     /// Sends a text message to the assistant and requests a response.
     func sendTextMessage() {
         guard !textInput.isEmpty else { return }
-        
+
         let message = textInput
         textInput = ""
-        
-        let newMessage = ChatMessage(id: UUID(), text: message, isUser: true)
+
         DispatchQueue.main.async {
-            self.finishedMessages.append(newMessage)
+            self.finishedMessages.append(ChatMessage(id: UUID(), text: message, isUser: true))
         }
-        
+
         let jsonMessage: [String: Any] = [
             "type": "conversation.item.create",
             "item": [
@@ -465,9 +467,9 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
                 ]
             ]
         ]
-        
+
         sendJSON(jsonMessage)
-        
+
         // Request a response from the assistant.
         sendResponseCreateEvent()
     }
@@ -651,49 +653,45 @@ class RealtimeSpeechViewModel: NSObject, ObservableObject {
             print("Speech recognizer is not available.")
             return
         }
-        
+
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        
+
         guard let recognitionRequest = recognitionRequest else {
             fatalError("Unable to create an SFSpeechAudioBufferRecognitionRequest object")
         }
-        
+
         recognitionRequest.shouldReportPartialResults = true
-        
+
         recognitionTask = recognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             guard let self = self else { return }
             var isFinal = false
-            
+
             if let result = result {
                 let transcription = result.bestTranscription.formattedString
                 print("Transcription: \(transcription)")
                 // Update the UI
                 DispatchQueue.main.async {
-                    // Update the finishedMessages with user's transcription if it's a complete message
-                    if result.isFinal {
-                        let message = ChatMessage(id: UUID(), text: transcription, isUser: true)
-                        self.finishedMessages.append(message)
+                    if self.currentlyWritingMessage == nil {
+                        self.currentlyWritingMessage = ChatMessage(id: UUID(), text: transcription, isUser: true)
                     } else {
-                        // Optionally handle intermediate transcriptions
-                        if let lastUserMessageIndex = self.finishedMessages.lastIndex(where: { $0.isUser }) {
-                            self.finishedMessages[lastUserMessageIndex].text = transcription
-                        } else {
-                            let message = ChatMessage(id: UUID(), text: transcription, isUser: true)
-                            self.finishedMessages.append(message)
-                        }
+                        self.currentlyWritingMessage?.text = transcription
                     }
                 }
                 isFinal = result.isFinal
             }
-            
+
             if error != nil || isFinal {
                 self.audioEngine?.stop()
                 self.audioEngine?.inputNode.removeTap(onBus: 0)
-                
+
                 self.recognitionRequest = nil
                 self.recognitionTask = nil
-                
+
                 DispatchQueue.main.async {
+                    if isFinal, let message = self.currentlyWritingMessage {
+                        self.finishedMessages.append(message)
+                        self.currentlyWritingMessage = nil
+                    }
                     self.currentState = .idle
                 }
             }
